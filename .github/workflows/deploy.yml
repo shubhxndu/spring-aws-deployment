@@ -101,9 +101,16 @@ jobs:
       - name: Verify application health endpoint
         shell: bash
         run: |
-          CNAME="$(aws elasticbeanstalk describe-environments \
+          ENVIRONMENT="$(aws elasticbeanstalk describe-environments \
             --environment-names "${EB_ENVIRONMENT}" \
-            --query 'Environments[0].CNAME' \
+            --query 'Environments[0].[CNAME,VersionLabel,Health,Status]' \
             --output text)"
+          read -r CNAME CURRENT_VERSION HEALTH STATUS <<< "${ENVIRONMENT}"
+
+          echo "Environment version=${CURRENT_VERSION} health=${HEALTH} status=${STATUS}"
+          test "${CURRENT_VERSION}" = "${VERSION_LABEL}"
+
           curl --fail --show-error --retry 10 --retry-delay 15 \
+            --output health.json \
             "http://${CNAME}/actuator/health"
+          jq --exit-status '.status == "UP"' health.json
