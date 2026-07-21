@@ -64,7 +64,7 @@ jobs:
       - name: Package Elastic Beanstalk source bundle
         shell: bash
         run: |
-          VERSION_LABEL="gh-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::8}"
+          VERSION_LABEL="gh-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA::8}"
           BUNDLE="${VERSION_LABEL}.zip"
           zip -r "${BUNDLE}" Dockerfile pom.xml src .dockerignore
           echo "VERSION_LABEL=${VERSION_LABEL}" >> "${GITHUB_ENV}"
