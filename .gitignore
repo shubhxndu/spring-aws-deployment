@@ -13,5 +13,6 @@ target/
 credentials
 credentials.*
 screenshots/
+deployments/
 .DS_Store
 Thumbs.db

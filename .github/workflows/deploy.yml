@@ -1,0 +1,110 @@
+name: Test and deploy
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: elastic-beanstalk-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-south-1
+  EB_APPLICATION: aws-assignment-task-api
+  EB_ENVIRONMENT: aws-assignment-task-api-env
+
+jobs:
+  test:
+    name: Test and build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Run Maven verification
+        run: mvn --batch-mode --no-transfer-progress verify
+
+      - name: Verify production Docker image
+        run: docker build --tag aws-assignment-task-api:${{ github.sha }} .
+
+  deploy:
+    name: Deploy to Elastic Beanstalk
+    if: github.event_name != 'pull_request'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Configure short-lived AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Package Elastic Beanstalk source bundle
+        shell: bash
+        run: |
+          VERSION_LABEL="gh-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::8}"
+          BUNDLE="${VERSION_LABEL}.zip"
+          zip -r "${BUNDLE}" Dockerfile pom.xml src .dockerignore
+          echo "VERSION_LABEL=${VERSION_LABEL}" >> "${GITHUB_ENV}"
+          echo "BUNDLE=${BUNDLE}" >> "${GITHUB_ENV}"
+
+      - name: Upload source bundle
+        shell: bash
+        run: |
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          BUCKET="elasticbeanstalk-${AWS_REGION}-${ACCOUNT_ID}"
+          OBJECT_KEY="github-actions/${GITHUB_REPOSITORY}/${BUNDLE}"
+          aws s3 cp "${BUNDLE}" "s3://${BUCKET}/${OBJECT_KEY}"
+          echo "BUCKET=${BUCKET}" >> "${GITHUB_ENV}"
+          echo "OBJECT_KEY=${OBJECT_KEY}" >> "${GITHUB_ENV}"
+
+      - name: Create application version
+        run: >-
+          aws elasticbeanstalk create-application-version
+          --application-name "${EB_APPLICATION}"
+          --version-label "${VERSION_LABEL}"
+          --source-bundle S3Bucket="${BUCKET}",S3Key="${OBJECT_KEY}"
+          --process
+
+      - name: Deploy application version
+        run: >-
+          aws elasticbeanstalk update-environment
+          --environment-name "${EB_ENVIRONMENT}"
+          --version-label "${VERSION_LABEL}"
+
+      - name: Wait for deployment
+        run: >-
+          aws elasticbeanstalk wait environment-updated
+          --environment-names "${EB_ENVIRONMENT}"
+
+      - name: Verify application health endpoint
+        shell: bash
+        run: |
+          CNAME="$(aws elasticbeanstalk describe-environments \
+            --environment-names "${EB_ENVIRONMENT}" \
+            --query 'Environments[0].CNAME' \
+            --output text)"
+          curl --fail --show-error --retry 10 --retry-delay 15 \
+            "http://${CNAME}/actuator/health"
