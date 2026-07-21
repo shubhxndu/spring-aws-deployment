@@ -1,0 +1,17 @@
+target
+.git
+.gitignore
+.env
+.env.local
+.env.*.local
+.idea
+.vscode
+*.iml
+*.pem
+*.key
+*.p12
+*.jks
+credentials
+credentials.*
+screenshots
+README.md

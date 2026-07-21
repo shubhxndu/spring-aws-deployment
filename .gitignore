@@ -1,0 +1,17 @@
+target/
+.env
+.env.local
+.env.*.local
+.idea/
+.vscode/
+*.iml
+*.log
+*.pem
+*.key
+*.p12
+*.jks
+credentials
+credentials.*
+screenshots/
+.DS_Store
+Thumbs.db
