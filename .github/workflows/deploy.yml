@@ -42,6 +42,14 @@ jobs:
       - name: Verify production Docker image
         run: docker build --tag aws-assignment-task-api:${{ github.sha }} .
 
+      - name: Upload tested application JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: application-jar-${{ github.run_attempt }}
+          path: target/aws-assignment-task-api-0.0.1-SNAPSHOT.jar
+          if-no-files-found: error
+          retention-days: 1
+
   deploy:
     name: Deploy to Elastic Beanstalk
     if: github.event_name != 'pull_request'
@@ -61,12 +69,20 @@ jobs:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Download tested application JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: application-jar-${{ github.run_attempt }}
+          path: deployment
+
       - name: Package Elastic Beanstalk source bundle
         shell: bash
         run: |
           VERSION_LABEL="gh-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA::8}"
           BUNDLE="${VERSION_LABEL}.zip"
-          zip -r "${BUNDLE}" Dockerfile pom.xml src .dockerignore
+          cp Dockerfile.elasticbeanstalk deployment/Dockerfile
+          mv deployment/aws-assignment-task-api-0.0.1-SNAPSHOT.jar deployment/app.jar
+          (cd deployment && zip -r "../${BUNDLE}" Dockerfile app.jar)
           echo "VERSION_LABEL=${VERSION_LABEL}" >> "${GITHUB_ENV}"
           echo "BUNDLE=${BUNDLE}" >> "${GITHUB_ENV}"
 
