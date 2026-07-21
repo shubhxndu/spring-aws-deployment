@@ -86,7 +86,6 @@ jobs:
           --application-name "${EB_APPLICATION}"
           --version-label "${VERSION_LABEL}"
           --source-bundle S3Bucket="${BUCKET}",S3Key="${OBJECT_KEY}"
-          --process
 
       - name: Deploy application version
         run: >-
