@@ -1,6 +1,6 @@
 # AWS Assignment Task API
 
-A minimal Spring Boot task manager built for local Docker Compose use and later deployment to the AWS Elastic Beanstalk Docker platform with Amazon RDS for PostgreSQL.
+A Spring Boot task manager deployed to the AWS Elastic Beanstalk Docker platform with Amazon RDS for PostgreSQL. The repository also contains the S3 static asset and the Lambda handler used by the assignment's S3-to-SQS-to-Lambda event flow.
 
 Repository: [github.com/shubhxndu/spring-aws-deployment](https://github.com/shubhxndu/spring-aws-deployment)
 
@@ -13,8 +13,22 @@ The application uses a straightforward layered structure:
 - Spring Data JPA persists `Task` entities.
 - PostgreSQL stores local and production data.
 - Spring Boot Actuator exposes application health.
+- Amazon S3 publishes object-created notifications to Amazon SQS.
+- AWS Lambda consumes the SQS messages and records S3 event details in CloudWatch Logs.
+- GitHub Actions tests, builds, and deploys the application through short-lived AWS OIDC credentials.
 
-There is no authentication, frontend, messaging, AWS SDK, or infrastructure code in this repository. The separate S3, SQS, and Lambda assignment components should be deployed independently.
+The application does not call AWS APIs directly. S3, SQS, Lambda, RDS, and Elastic Beanstalk are configured as separate managed AWS resources.
+
+## Deployed architecture
+
+```text
+Internet -> Elastic Beanstalk (single EC2 instance) -> private Amazon RDS PostgreSQL
+
+S3 uploads/ -> SQS queue -> Lambda -> CloudWatch Logs
+S3 static/  -> public read-only static files
+
+GitHub Actions -> AWS OIDC role -> Elastic Beanstalk deployment
+```
 
 ## Prerequisites
 
@@ -184,7 +198,7 @@ Use a dedicated application database user. Supply its password at deployment tim
 ## Elastic Beanstalk configuration
 
 1. Create an Elastic Beanstalk environment using the current Docker platform.
-2. Deploy a source bundle containing the `Dockerfile`, `pom.xml`, and `src` directory. Elastic Beanstalk builds and runs the Docker image.
+2. The GitHub Actions workflow verifies the full `Dockerfile`, builds the application JAR, and packages it with `Dockerfile.elasticbeanstalk` for deployment. This avoids compiling Java on the small Elastic Beanstalk instance.
 3. In the Elastic Beanstalk console, open **Configuration**, then configure environment properties.
 4. Add `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USERNAME`, `DB_PASSWORD`, and `PORT` (normally `8080` for this container).
 5. Set `SEED_DATA_ENABLED=false` when sample production data is not wanted.
@@ -200,9 +214,23 @@ Do not deploy `docker-compose.yml` as the production topology. It is for local d
 - `spring.jpa.hibernate.ddl-auto=update` is intentional for this academic assignment.
 - Keep the Elastic Beanstalk environment and RDS in the same VPC, with RDS in private subnets.
 - Use Elastic Beanstalk application logs and enhanced health plus CloudWatch Logs for startup, API, and failure diagnosis.
-- A future GitHub Actions workflow can package the source bundle and deploy an application version. Store AWS deployment credentials in GitHub Actions secrets or use OIDC; do not add credentials to this repository.
-- Prefer GitHub Actions OIDC with a narrowly scoped AWS IAM role instead of long-lived AWS access keys.
+- `.github/workflows/deploy.yml` tests and builds every pull request and deploys pushes to `main`.
+- Deployment uses GitHub Actions OIDC with the repository variable `AWS_DEPLOY_ROLE_ARN`; no long-lived AWS access key is stored in GitHub.
 - The application does not need AWS SDK dependencies because it does not call AWS services directly.
+
+## S3, SQS, and Lambda
+
+The static example file is stored at `static/index.html`. In AWS, only objects under the bucket's `static/` prefix are granted public `s3:GetObject` access.
+
+The Lambda console handler is stored at `lambda/sqs_logger/lambda_function.py`. It accepts SQS batches, parses the nested S3 event, URL-decodes the object key, and logs the message ID, event name, bucket, and key. It also returns failed SQS message identifiers for partial-batch retry handling.
+
+Run its dependency-free unit test with:
+
+```bash
+python -m unittest discover -s lambda/sqs_logger -v
+```
+
+The Lambda execution role needs `AWSLambdaSQSQueueExecutionRole`, and the SQS event source mapping should enable `ReportBatchItemFailures`.
 
 ## Logs
 
