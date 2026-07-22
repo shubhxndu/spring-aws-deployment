@@ -14,8 +14,8 @@
     <groupId>com.example</groupId>
     <artifactId>aws-assignment-task-api</artifactId>
     <version>0.0.1-SNAPSHOT</version>
-    <name>AWS Assignment Task API</name>
-    <description>Minimal task manager for an AWS deployment assignment</description>
+    <name>AWS Cloud Task API</name>
+    <description>Task manager for learning AWS deployment, monitoring, and automation</description>
 
     <properties>
         <java.version>21</java.version>

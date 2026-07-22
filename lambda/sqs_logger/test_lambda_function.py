@@ -11,7 +11,7 @@ class LambdaFunctionTest(unittest.TestCase):
                 {
                     "eventName": "ObjectCreated:Put",
                     "s3": {
-                        "bucket": {"name": "assignment-bucket"},
+                        "bucket": {"name": "learning-project-bucket"},
                         "object": {"key": "uploads/test+file.txt"},
                     },
                 }
@@ -31,7 +31,7 @@ class LambdaFunctionTest(unittest.TestCase):
 
         self.assertEqual(1, result["processedRecords"])
         self.assertEqual([], result["batchItemFailures"])
-        self.assertIn("assignment-bucket", " ".join(logs.output))
+        self.assertIn("learning-project-bucket", " ".join(logs.output))
         self.assertIn("uploads/test file.txt", " ".join(logs.output))
 
 

@@ -14,7 +14,11 @@ __pycache__/
 *.jks
 credentials
 credentials.*
-screenshots/
+/screenshots/
+/tools/redact_screenshots.py
+/tools/test_redact_screenshots.py
 deployments/
+/AWS-Assignment-Shubhendu.zip
+/AWS-Assignment-Shubhendu/
 .DS_Store
 Thumbs.db

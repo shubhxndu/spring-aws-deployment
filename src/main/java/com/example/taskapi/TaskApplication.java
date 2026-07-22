@@ -18,6 +18,6 @@ public class TaskApplication {
 
     @Bean
     CommandLineRunner startupLogger() {
-        return args -> log.info("AWS Assignment Task API started successfully");
+        return args -> log.info("AWS Cloud Task API started successfully");
     }
 }

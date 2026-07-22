@@ -33,7 +33,7 @@ class TaskApiIntegrationTests {
     void homeReturnsApplicationStatus() throws Exception {
         mockMvc.perform(get("/"))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.application").value("AWS Assignment Task API"))
+                .andExpect(jsonPath("$.application").value("AWS Cloud Task API"))
                 .andExpect(jsonPath("$.status").value("running"));
     }
 

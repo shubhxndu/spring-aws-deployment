@@ -11,7 +11,7 @@ public class HomeController {
     @GetMapping("/")
     public Map<String, String> home() {
         return Map.of(
-                "application", "AWS Assignment Task API",
+                "application", "AWS Cloud Task API",
                 "status", "running");
     }
 }

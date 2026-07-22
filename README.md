@@ -1,319 +1,803 @@
-# AWS Assignment Task API
+# AWS Cloud Deployment Learning Project
 
-A Spring Boot task manager deployed to the AWS Elastic Beanstalk Docker platform with Amazon RDS for PostgreSQL. The repository also contains the S3 static asset and the Lambda handler used by the assignment's S3-to-SQS-to-Lambda event flow.
+This is a hands-on project I built to learn how to deploy and operate a scalable web application on AWS. It combines a Spring Boot task API, PostgreSQL, Docker, GitHub Actions CI/CD, an S3-to-SQS-to-Lambda event flow, and CloudWatch monitoring and alarms.
 
-Repository: [github.com/shubhxndu/spring-aws-deployment](https://github.com/shubhxndu/spring-aws-deployment)
+## What this project demonstrates
+
+- A custom VPC spans two Availability Zones with public and private subnets.
+- Elastic Beanstalk runs the Dockerized Spring application on one low-cost EC2 instance.
+- Amazon RDS for PostgreSQL runs privately on `db.t4g.micro`.
+- Security groups allow PostgreSQL only from the application security group.
+- S3 sends `uploads/` object-created events to SQS.
+- Lambda consumes SQS messages and writes structured event details to CloudWatch Logs.
+- Only S3 objects under `static/` are publicly readable.
+- CloudWatch monitors Elastic Beanstalk/EC2 and RDS and provides CPU alarms.
+- GitHub Actions tests, packages, and deploys the application with AWS OIDC.
+
+## Public-repository safety
+
+All values in this guide use placeholders such as `<AWS_ACCOUNT_ID>`, `<AWS_REGION>`, and `<UNIQUE_BUCKET_NAME>`. Never commit an actual database password, AWS access key, session token, `.env` file, or downloaded credential.
+
+The images embedded below are public-safe copies. Account numbers, AWS resource IDs, ARNs, endpoints, repository identity, commit and request identifiers, and every literal IP address were irreversibly masked. The ignored `screenshots/` directory contains the local originals and must not be committed.
 
 ## Architecture
 
-The application uses a straightforward layered structure:
-
-- REST controllers handle HTTP requests and responses.
-- A service contains the task CRUD operations.
-- Spring Data JPA persists `Task` entities.
-- PostgreSQL stores local and production data.
-- Spring Boot Actuator exposes application health.
-- Amazon S3 publishes object-created notifications to Amazon SQS.
-- AWS Lambda consumes the SQS messages and records S3 event details in CloudWatch Logs.
-- GitHub Actions tests, builds, and deploys the application through short-lived AWS OIDC credentials.
-
-The application does not call AWS APIs directly. S3, SQS, Lambda, RDS, and Elastic Beanstalk are configured as separate managed AWS resources.
-
-## Deployed architecture
-
 ```text
-Internet -> Elastic Beanstalk (single EC2 instance) -> private Amazon RDS PostgreSQL
+Internet
+   |
+   v
+Elastic Beanstalk (Docker, single EC2 instance in a public subnet)
+   |
+   | PostgreSQL 5432, security-group-to-security-group rule
+   v
+Amazon RDS PostgreSQL (private subnets across two Availability Zones)
 
-S3 uploads/ -> SQS queue -> Lambda -> CloudWatch Logs
-S3 static/  -> public read-only static files
+S3 uploads/ --> SQS Standard queue --> Lambda --> CloudWatch Logs
+S3 static/  --> public read-only objects
 
-GitHub Actions -> AWS OIDC role -> Elastic Beanstalk deployment
+GitHub Actions --> GitHub OIDC --> IAM deployment role --> Elastic Beanstalk
 ```
 
-## Prerequisites
+## Cost-conscious choices
 
-- Docker Desktop or Docker Engine with Docker Compose
-- Optional for running Maven directly: Java 21 and Maven 3.9+
-- `curl` for API verification
+- Elastic Beanstalk uses a single `t3.micro` instance instead of a load-balanced environment.
+- RDS uses a single-AZ `db.t4g.micro` instance.
+- No NAT gateway is created.
+- SQS uses short retention and AWS-managed server-side encryption.
+- Lambda uses ARM64 and the default 128 MB memory allocation.
+- Log retention is one day for this learning environment.
+- CloudWatch alarms have no SNS notification topic.
+- Delete the environment, database, bucket objects, queue, Lambda function, alarms, and unused IAM resources when the project is no longer in use.
 
-## Run with Docker Compose
+## Reusable placeholders
 
-Create a private local environment file from the committed template:
+| Placeholder | Meaning |
+| --- | --- |
+| `<AWS_ACCOUNT_ID>` | Your 12-digit AWS account ID |
+| `<AWS_REGION>` | Deployment region, for example `ap-south-1` |
+| `<VPC_CIDR>` | Private address range selected for the VPC |
+| `<PUBLIC_DEFAULT_ROUTE>` | Default IPv4 route used only by public subnets |
+| `<GITHUB_OWNER>` | GitHub account or organization |
+| `<GITHUB_REPOSITORY>` | GitHub repository name |
+| `<UNIQUE_BUCKET_NAME>` | Globally unique S3 bucket name |
+| `<SQS_QUEUE_NAME>` | SQS queue name |
+| `<RDS_ENDPOINT>` | Private RDS endpoint; never commit the real value |
+| `<ELASTIC_BEANSTALK_CNAME>` | Generated Beanstalk domain; omit it from public evidence |
+
+## Implementation walkthrough
+
+<details>
+<summary><strong>Step 0 — Build and test the Spring Boot application locally</strong></summary>
+
+### Purpose
+
+Create a working application and database configuration before provisioning AWS resources. The API uses Spring Boot 3, Java 21, Spring Data JPA, PostgreSQL, validation, and Actuator health checks.
+
+### Steps
+
+1. Keep application code under `src/main/java` and tests under `src/test/java`.
+2. Configure the JDBC connection through environment variables in `src/main/resources/application.properties`.
+3. Use `docker-compose.yml` for the local PostgreSQL database and application.
+4. Copy `.env.example` to an ignored `.env` and set a local-only password.
+5. Run the application:
+
+   ```bash
+   docker compose up --build
+   ```
+
+6. Run the Java test suite:
+
+   ```bash
+   mvn test
+   ```
+
+7. Verify the local endpoints:
+
+   ```text
+   GET  /
+   GET  /actuator/health
+   GET  /api/tasks
+   GET  /api/tasks/{id}
+   POST /api/tasks
+   PUT  /api/tasks/{id}
+   DELETE /api/tasks/{id}
+   ```
+
+The main `Dockerfile` performs a reproducible multi-stage build. `Dockerfile.elasticbeanstalk` runs the JAR already tested and built by GitHub Actions, avoiding Java compilation on a small EC2 instance.
+
+</details>
+
+<details>
+<summary><strong>Step 1 — Create the VPC and subnet topology</strong></summary>
+
+### Purpose
+
+Provide network isolation for the application and database while satisfying the requirement for public and private subnets.
+
+### Steps
+
+1. Open **VPC → Create VPC → VPC and more**.
+2. Set the name to `aws-assignment-vpc` and choose a private IPv4 CIDR represented here as `<VPC_CIDR>`.
+3. Select two Availability Zones.
+4. Create two public and two private subnets.
+5. Create an Internet Gateway for the public route table.
+6. Do not create a NAT gateway because this setup does not require private-subnet internet access.
+7. Confirm DNS resolution and DNS hostnames are enabled.
+8. Verify that public subnets use the IPv4 default route `<PUBLIC_DEFAULT_ROUTE>` through the Internet Gateway and private subnets have no public route.
+
+### Evidence
+
+![VPC resource map with public and private subnets](docs/screenshots/01-vpc-resource-map.png)
+
+</details>
+
+<details>
+<summary><strong>Step 2 — Create the RDS DB subnet group</strong></summary>
+
+### Purpose
+
+Force RDS to use private subnets while meeting the RDS requirement for subnets in at least two Availability Zones.
+
+### Steps
+
+1. Open **RDS → Subnet groups → Create DB subnet group**.
+2. Name it `aws-assignment-db-subnet-group`.
+3. Select `aws-assignment-vpc`.
+4. Select both private subnets, one in each Availability Zone.
+5. Create the group and confirm that exactly the intended private subnets appear.
+
+### Evidence
+
+![RDS private DB subnet group](docs/screenshots/02-rds-subnet-group.png)
+
+</details>
+
+<details>
+<summary><strong>Step 3 — Configure application and database security groups</strong></summary>
+
+### Purpose
+
+Allow application traffic while ensuring PostgreSQL is never exposed directly to the internet.
+
+### Steps
+
+1. Create `aws-assignment-app-sg` in the project VPC.
+2. For the single-instance Beanstalk environment, allow HTTP port `80` to the application security group.
+3. Create `aws-assignment-rds-sg` in the same VPC.
+4. Add one inbound rule to the RDS group:
+   - Type: `PostgreSQL`
+   - Protocol: `TCP`
+   - Port: `5432`
+   - Source: `aws-assignment-app-sg`
+5. Do not use an unrestricted IPv4 source for the database rule.
+6. Keep default outbound access unless the application requires additional egress restrictions.
+
+### Evidence
+
+![Application and database security groups](docs/screenshots/03a-security-groups-list.png)
+
+![RDS inbound rule sourced from the application security group](docs/screenshots/03b-rds-inbound-rule.png)
+
+</details>
+
+<details>
+<summary><strong>Step 4 — Create the private Amazon RDS PostgreSQL database</strong></summary>
+
+### Purpose
+
+Provide a managed relational database for the Spring application without exposing the database publicly.
+
+### Steps
+
+1. Open **RDS → Databases → Create database**.
+2. Select PostgreSQL and the free-tier/template option available to the account.
+3. Use DB identifier `aws-assignment-postgres`.
+4. Select `db.t4g.micro` (or `db.t3.micro` if required by the region/account).
+5. Select single-AZ deployment.
+6. Set the initial database name to `taskdb` and create an application user such as `appadmin`.
+7. Store the password privately; do not put it in source code, README content, logs, or screenshots.
+8. Under connectivity:
+   - Select `aws-assignment-vpc`.
+   - Select `aws-assignment-db-subnet-group`.
+   - Set **Public access** to **No**.
+   - Attach `aws-assignment-rds-sg`.
+9. Use minimal storage and disable optional paid features that are not required.
+10. Wait until the instance state becomes **Available**.
+
+### Evidence
+
+![RDS PostgreSQL instance available](docs/screenshots/04a-rds-database-available.png)
+
+![RDS connectivity and security group association](docs/screenshots/04b-rds-connectivity.png)
+
+</details>
+
+<details>
+<summary><strong>Step 5 — Create the Elastic Beanstalk EC2 instance role</strong></summary>
+
+### Purpose
+
+Allow the EC2 instance managed by Elastic Beanstalk to perform the platform operations required for a Docker web environment.
+
+### Steps
+
+1. Open **IAM → Roles → Create role**.
+2. Choose **AWS service** and the EC2 use case.
+3. Name the role `aws-elasticbeanstalk-ec2-role`.
+4. Attach the Elastic Beanstalk web-tier policy required by the selected platform.
+5. For the Docker platform used in this project, the role also included the Elastic Beanstalk Docker/worker managed policies shown below.
+6. Confirm that an EC2 instance profile exists for the role.
+
+### Evidence
+
+![Elastic Beanstalk EC2 instance role](docs/screenshots/05-eb-ec2-instance-role.png)
+
+</details>
+
+<details>
+<summary><strong>Step 6 — Create the Elastic Beanstalk service role</strong></summary>
+
+### Purpose
+
+Allow Elastic Beanstalk itself to report enhanced health and manage supported platform updates.
+
+### Steps
+
+1. Create an IAM role trusted by Elastic Beanstalk.
+2. Name it `aws-elasticbeanstalk-service-role`.
+3. Attach:
+   - `AWSElasticBeanstalkEnhancedHealth`
+   - `AWSElasticBeanstalkManagedUpdatesCustomerRolePolicy`
+4. Use this role as the service role when creating the environment.
+
+### Evidence
+
+![Elastic Beanstalk service role](docs/screenshots/06-eb-service-role.png)
+
+</details>
+
+<details>
+<summary><strong>Step 7 — Register GitHub Actions as an AWS OIDC provider</strong></summary>
+
+### Purpose
+
+Enable GitHub Actions to obtain short-lived AWS credentials without storing long-lived access keys in GitHub.
+
+### Steps
+
+1. Open **IAM → Identity providers → Add provider**.
+2. Select **OpenID Connect**.
+3. Set provider URL to `https://token.actions.githubusercontent.com`.
+4. Set audience to `sts.amazonaws.com`.
+5. Create the provider.
+
+### Evidence
+
+![GitHub Actions OIDC provider](docs/screenshots/07-github-oidc-provider.png)
+
+</details>
+
+<details>
+<summary><strong>Step 8 — Create the low-cost Elastic Beanstalk environment</strong></summary>
+
+### Purpose
+
+Deploy the application on AWS while avoiding the cost of a load balancer and multiple EC2 instances.
+
+### Steps
+
+1. Open **Elastic Beanstalk → Create application**.
+2. Use application name `aws-assignment-task-api`.
+3. Use environment name `aws-assignment-task-api-env`.
+4. Select the Docker platform on 64-bit Amazon Linux 2023.
+5. Choose **Single instance**, not high availability/load balanced.
+6. Use a `t3.micro` EC2 instance.
+7. Select the project VPC and a public subnet.
+8. Enable a public IP for the single EC2 instance and attach `aws-assignment-app-sg`.
+9. Select the EC2 instance profile and Elastic Beanstalk service role created earlier.
+10. Configure the health-check path as `/actuator/health`.
+11. Enable CloudWatch log streaming with one-day retention for this learning environment.
+12. Add environment properties without exposing their values publicly:
+
+    ```text
+    DB_HOST=<RDS_ENDPOINT>
+    DB_PORT=5432
+    DB_NAME=taskdb
+    DB_USERNAME=<DATABASE_USERNAME>
+    DB_PASSWORD=<DATABASE_PASSWORD>
+    PORT=8080
+    SEED_DATA_ENABLED=true
+    ```
+
+### Evidence
+
+![Healthy Elastic Beanstalk single-instance environment](docs/screenshots/08a-eb-sample-environment.png)
+
+</details>
+
+<details>
+<summary><strong>Step 9 — Create the GitHub Actions deployment role</strong></summary>
+
+### Purpose
+
+Restrict AWS role assumption to the repository's `main` branch and grant the deployment workflow the permissions needed to publish an Elastic Beanstalk application version.
+
+### Steps
+
+1. Create IAM role `GitHubActionsElasticBeanstalkDeployRole` using the GitHub OIDC provider.
+2. Restrict the trust relationship to the exact repository and `main` branch.
+3. Replace every placeholder in the following complete trust policy before saving:
+
+    ```json
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Principal": {
+            "Federated": "arn:aws:iam::<AWS_ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com"
+          },
+          "Action": "sts:AssumeRoleWithWebIdentity",
+          "Condition": {
+            "StringEquals": {
+              "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+              "token.actions.githubusercontent.com:sub": "repo:<GITHUB_OWNER>/<GITHUB_REPOSITORY>:ref:refs/heads/main"
+            }
+          }
+        }
+      ]
+    }
+    ```
+
+4. This learning setup attached the AWS-managed `AdministratorAccess-AWSElasticBeanstalk` policy because Elastic Beanstalk updates call dependent CloudFormation, EC2, S3, and CloudWatch Logs APIs. The OIDC trust still limits role assumption to one repository branch.
+5. For production, replace the managed policy with a CloudTrail-derived least-privilege policy scoped to the application, environment, deployment bucket, and Beanstalk-managed stack.
+
+### Evidence
+
+![GitHub Actions deployment role permissions](docs/screenshots/09a-github-deploy-role-policy.png)
+
+![GitHub Actions deployment role trust relationship](docs/screenshots/09b-github-role-trust.png)
+
+</details>
+
+<details>
+<summary><strong>Step 10 — Add the deployment role ARN to GitHub</strong></summary>
+
+### Purpose
+
+Provide the workflow with a non-secret role identifier while keeping credentials short-lived and generated at runtime.
+
+### Steps
+
+1. Open the GitHub repository.
+2. Go to **Settings → Secrets and variables → Actions → Variables**.
+3. Create repository variable `AWS_DEPLOY_ROLE_ARN`.
+4. Set its value to:
+
+   ```text
+   arn:aws:iam::<AWS_ACCOUNT_ID>:role/GitHubActionsElasticBeanstalkDeployRole
+   ```
+
+5. Do not create `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY` secrets.
+
+### Evidence
+
+![GitHub Actions deployment role variable](docs/screenshots/10-github-actions-variable.png)
+
+</details>
+
+<details>
+<summary><strong>Step 11 — Configure and run the GitHub Actions CI/CD pipeline</strong></summary>
+
+### Purpose
+
+Automatically test, build, package, deploy, and verify every application change pushed to `main`.
+
+### Steps
+
+1. Store the workflow at `.github/workflows/deploy.yml`.
+2. On pull requests, run Maven verification and build the production Docker image.
+3. On pushes to `main`, request an OIDC token and assume the AWS deployment role.
+4. Upload the tested JAR as a short-lived GitHub artifact.
+5. Package the JAR with `Dockerfile.elasticbeanstalk`.
+6. Upload the bundle to the account's Elastic Beanstalk S3 bucket.
+7. Create a retry-safe application version label.
+8. Update the environment and wait for completion.
+9. Verify that the deployed version matches the workflow version and that `/actuator/health` reports `UP`.
+
+The complete workflow is available in [deploy.yml](.github/workflows/deploy.yml).
+
+### Evidence
+
+![Successful GitHub Actions test and deployment jobs](docs/screenshots/11-github-actions-deployment-success.png)
+
+</details>
+
+<details>
+<summary><strong>Step 12 — Verify the deployed application and RDS connection</strong></summary>
+
+### Purpose
+
+Prove that the deployed container is running and that Spring can connect to the private PostgreSQL database.
+
+### Steps
+
+1. Open the generated Beanstalk URL without publishing it in the repository.
+2. Request:
+
+   ```text
+   http://<ELASTIC_BEANSTALK_CNAME>/actuator/health
+   ```
+
+3. Confirm the overall status is `UP`.
+4. Confirm the `db` component reports `UP` and identifies PostgreSQL.
+5. Confirm no database endpoint, username, or password appears in the response.
+
+### Evidence
+
+![Deployed application and PostgreSQL health](docs/screenshots/12-deployed-application-health.png)
+
+</details>
+
+<details>
+<summary><strong>Step 13 — Stream and review Elastic Beanstalk logs in CloudWatch</strong></summary>
+
+### Purpose
+
+Meet the logging requirement and make container deployment/startup failures diagnosable.
+
+### Steps
+
+1. In Elastic Beanstalk, enable instance log streaming to CloudWatch Logs.
+2. Set a short retention period suitable for this learning environment.
+3. Open **CloudWatch → Log groups**.
+4. Select the Beanstalk environment log group and the latest instance stream.
+5. Review `eb-engine.log` for Docker pull, image build, and deployment messages.
+6. Never include environment-variable values or credentials in logs.
+
+### Evidence
+
+![Elastic Beanstalk engine log in CloudWatch](docs/screenshots/13-eb-cloudwatch-engine-log.png)
+
+</details>
+
+<details>
+<summary><strong>Step 14 — Create the SQS queue and allow S3 notifications</strong></summary>
+
+### Purpose
+
+Buffer S3 upload events so Lambda can process them asynchronously and retry failures safely.
+
+### Steps
+
+1. Open **SQS → Create queue**.
+2. Choose a Standard queue named `aws-assignment-upload-queue`.
+3. Use a 30-second visibility timeout and one-day message retention.
+4. Enable SQS-managed server-side encryption.
+5. Edit the queue access policy and replace every placeholder in this complete JSON:
+
+    ```json
+    {
+      "Version": "2012-10-17",
+      "Id": "S3UploadNotificationPolicy",
+      "Statement": [
+        {
+          "Sid": "AllowS3ToSendUploadNotifications",
+          "Effect": "Allow",
+          "Principal": {
+            "Service": "s3.amazonaws.com"
+          },
+          "Action": "sqs:SendMessage",
+          "Resource": "arn:aws:sqs:<AWS_REGION>:<AWS_ACCOUNT_ID>:<SQS_QUEUE_NAME>",
+          "Condition": {
+            "ArnLike": {
+              "aws:SourceArn": "arn:aws:s3:*:*:<UNIQUE_BUCKET_NAME>"
+            },
+            "StringEquals": {
+              "aws:SourceAccount": "<AWS_ACCOUNT_ID>"
+            }
+          }
+        }
+      ]
+    }
+    ```
+
+The source-account and source-bucket conditions prevent unrelated S3 buckets from sending messages to the queue.
+
+</details>
+
+<details>
+<summary><strong>Step 15 — Create the S3 bucket and S3-to-SQS event notification</strong></summary>
+
+### Purpose
+
+Send an event to SQS whenever a file is uploaded under the bucket's `uploads/` prefix.
+
+### Steps
+
+1. Create a general-purpose S3 bucket in the same region as SQS and Lambda.
+2. Keep default S3 server-side encryption enabled.
+3. Open **Properties → Event notifications → Create event notification**.
+4. Use name `send-uploads-to-sqs`.
+5. Select **All object create events**.
+6. Set prefix to `uploads/`.
+7. Select the Standard SQS queue created earlier.
+8. Save the event notification. If validation fails, correct the SQS queue policy before retrying.
+
+### Evidence
+
+![S3 object-created notification to SQS](docs/screenshots/14-s3-event-notification-to-sqs.png)
+
+</details>
+
+<details>
+<summary><strong>Step 16 — Allow public read only for S3 static files</strong></summary>
+
+### Purpose
+
+Meet the public-static-file requirement without exposing uploads or every object in the bucket.
+
+### Steps
+
+1. Disable bucket-level block-public-access only for the deliberately public `static/` prefix used in this project.
+2. Do not grant public write, list, delete, or ACL permissions.
+3. Add this complete bucket policy after replacing `<UNIQUE_BUCKET_NAME>`:
+
+    ```json
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Sid": "PublicReadStaticFiles",
+          "Effect": "Allow",
+          "Principal": "*",
+          "Action": "s3:GetObject",
+          "Resource": "arn:aws:s3:::<UNIQUE_BUCKET_NAME>/static/*"
+        }
+      ]
+    }
+    ```
+
+4. Confirm the resource ends in `/static/*`; do not use a bucket-wide `/*` resource.
+
+### Evidence
+
+![S3 policy restricted to the static prefix](docs/screenshots/15-s3-public-read-policy.png)
+
+</details>
+
+<details>
+<summary><strong>Step 17 — Upload and verify the public static file</strong></summary>
+
+### Purpose
+
+Demonstrate that static content is publicly readable while the upload-processing prefix remains separate.
+
+### Steps
+
+1. Upload `static/index.html` from this repository using the object key `static/index.html`.
+2. Open the object URL:
+
+   ```text
+   https://<UNIQUE_BUCKET_NAME>.s3.<AWS_REGION>.amazonaws.com/static/index.html
+   ```
+
+3. Confirm the HTML page loads without AWS credentials.
+4. Do not publish the live bucket URL or an account-derived bucket name in a public README.
+
+### Evidence
+
+![Public static HTML file served from S3](docs/screenshots/16-s3-public-static-file.png)
+
+</details>
+
+<details>
+<summary><strong>Step 18 — Create the Lambda SQS event processor</strong></summary>
+
+### Purpose
+
+Consume SQS messages, parse the nested S3 object-created event, and write useful records to CloudWatch Logs.
+
+### Steps
+
+1. Create function `aws-assignment-sqs-logger`.
+2. Choose Python 3.13, ARM64, and the default 128 MB memory allocation.
+3. Create a basic Lambda execution role.
+4. Paste and deploy [lambda_function.py](lambda/sqs_logger/lambda_function.py).
+5. Attach AWS-managed policy `AWSLambdaSQSQueueExecutionRole` to the execution role.
+6. Add the SQS queue as an event source with:
+   - Batch size: `10`
+   - Batch window: `0`
+   - Trigger enabled: `Yes`
+   - Report batch item failures: `Yes`
+7. Run the local Lambda unit test:
+
+   ```bash
+   python -m unittest discover -s lambda/sqs_logger -v
+   ```
+
+The handler URL-decodes object keys and returns `batchItemFailures` so Lambda can retry only failed SQS messages.
+
+### Evidence
+
+![Enabled SQS trigger on the Lambda function](docs/screenshots/17-lambda-sqs-trigger.png)
+
+</details>
+
+<details>
+<summary><strong>Step 19 — Test S3 to SQS to Lambda to CloudWatch end to end</strong></summary>
+
+### Purpose
+
+Prove the complete asynchronous automation path works rather than testing each resource in isolation.
+
+### Steps
+
+1. Upload a small file with object key `uploads/index.html`.
+2. Wait for S3 to send the event to SQS and for Lambda to poll the queue.
+3. Open **Lambda → Monitor → View CloudWatch logs**.
+4. Open the newest log stream.
+5. Confirm an entry contains:
+
+   ```text
+   event=ObjectCreated:Put ... key=uploads/index.html
+   ```
+
+6. Confirm no database credential, account number, or sensitive URL is logged.
+
+### Evidence
+
+![Lambda CloudWatch log showing the S3 object-created event](docs/screenshots/18-lambda-cloudwatch-logs.png)
+
+</details>
+
+<details>
+<summary><strong>Step 20 — Create the Elastic Beanstalk EC2 CPU alarm</strong></summary>
+
+### Purpose
+
+Alert when the EC2 instance underlying the single-instance Elastic Beanstalk environment experiences sustained high CPU usage.
+
+### Steps
+
+1. Open **CloudWatch → Alarms → Create alarm**.
+2. Select **EC2 → Per-Instance Metrics**.
+3. Choose `CPUUtilization` for the current Beanstalk EC2 instance.
+4. Configure:
+   - Statistic: `Average`
+   - Period: `5 minutes`
+   - Static threshold: `Greater than or equal to 80`
+   - Datapoints to alarm: `1 out of 1`
+5. Do not create an SNS topic for this minimal-cost learning setup.
+6. Name the alarm `aws-assignment-eb-high-cpu`.
+
+### Evidence
+
+![Elastic Beanstalk EC2 high CPU alarm](docs/screenshots/19-eb-cpu-alarm.png)
+
+</details>
+
+<details>
+<summary><strong>Step 21 — Create the RDS CPU alarm</strong></summary>
+
+### Purpose
+
+Monitor the database independently from the application host and identify database CPU saturation.
+
+### Steps
+
+1. Open **CloudWatch → Alarms → Create alarm**.
+2. Select **RDS → Per-Database Metrics**.
+3. Choose `CPUUtilization` for `aws-assignment-postgres`.
+4. Configure:
+   - Statistic: `Average`
+   - Period: `5 minutes`
+   - Static threshold: `Greater than or equal to 80`
+   - Datapoints to alarm: `1 out of 1`
+5. Do not create an SNS topic for this minimal-cost learning setup.
+6. Name the alarm `aws-assignment-rds-high-cpu`.
+
+### Evidence
+
+![RDS PostgreSQL high CPU alarm](docs/screenshots/20-rds-cpu-alarm.png)
+
+</details>
+
+<details>
+<summary><strong>Step 22 — Review Elastic Beanstalk monitoring metrics</strong></summary>
+
+### Purpose
+
+Demonstrate that the environment publishes operational metrics to CloudWatch and that CPU and network behavior can be reviewed.
+
+### Steps
+
+1. Open the Elastic Beanstalk environment.
+2. Select **Health & monitoring**.
+3. Choose a recent time range such as three hours.
+4. Review environment health, CPU utilization, network in, and network out.
+5. Correlate changes with deployments and health-check requests.
+
+### Evidence
+
+![Elastic Beanstalk environment metrics](docs/screenshots/21-eb-cloudwatch-monitoring.png)
+
+</details>
+
+<details>
+<summary><strong>Step 23 — Review RDS monitoring metrics</strong></summary>
+
+### Purpose
+
+Demonstrate that RDS publishes CloudWatch metrics for database load, connections, memory, storage, latency, throughput, and I/O.
+
+### Steps
+
+1. Open **RDS → Databases → aws-assignment-postgres**.
+2. Select **Monitoring**.
+3. Choose a recent time range.
+4. Review `CPUUtilization`, `DatabaseConnections`, `FreeableMemory`, and `FreeStorageSpace`.
+5. Review read/write operations, latency, and throughput for additional evidence.
+
+### Evidence
+
+![RDS PostgreSQL CloudWatch metrics](docs/screenshots/22-rds-cloudwatch-monitoring.png)
+
+</details>
+
+## Verification commands
+
+Run the Spring test suite with local Maven:
 
 ```bash
-cp .env.example .env
+mvn --batch-mode --no-transfer-progress test
 ```
 
-On PowerShell, use:
-
-```powershell
-Copy-Item .env.example .env
-```
-
-Open `.env` and set `DB_PASSWORD` to a local-only PostgreSQL password. The `.env` file is ignored by Git and must never be committed.
-
-Then build and start PostgreSQL and the application:
+Or use a Java 21 Maven container:
 
 ```bash
-docker compose up --build
+docker run --rm \
+  -v maven-cache:/root/.m2 \
+  -v "$PWD:/workspace" \
+  -w /workspace \
+  maven:3.9.11-eclipse-temurin-21 \
+  mvn --batch-mode --no-transfer-progress test
 ```
 
-The application is available at:
-
-```text
-http://localhost:8080
-```
-
-Compose uses the PostgreSQL service name `postgres` as `DB_HOST`. It also creates a named `postgres_data` volume, so task data remains after container restarts.
-
-Verify the running services:
-
-```bash
-curl http://localhost:8080/
-curl http://localhost:8080/actuator/health
-curl http://localhost:8080/api/tasks
-```
-
-## Stop the application
-
-Stop and remove containers while keeping the database volume:
-
-```bash
-docker compose down
-```
-
-Also remove the database volume and all local task data:
-
-```bash
-docker compose down --volumes
-```
-
-## Run tests
-
-With Java 21 and Maven installed:
-
-```bash
-mvn test
-```
-
-Or run the tests in a Java 21 Maven container:
-
-```bash
-docker run --rm -v maven-cache:/root/.m2 -v "$PWD:/workspace" -w /workspace maven:3.9.11-eclipse-temurin-21 mvn test
-```
-
-Tests use an in-memory H2 database in PostgreSQL compatibility mode. They do not require a running PostgreSQL instance.
-
-## API endpoints
-
-| Method | Endpoint | Description | Success status |
-| --- | --- | --- | --- |
-| GET | `/` | Application name and running status | 200 |
-| GET | `/actuator/health` | Application and database health | 200 |
-| GET | `/api/tasks` | List all tasks | 200 |
-| GET | `/api/tasks/{id}` | Retrieve one task | 200 |
-| POST | `/api/tasks` | Create a task | 201 |
-| PUT | `/api/tasks/{id}` | Update a task | 200 |
-| DELETE | `/api/tasks/{id}` | Delete a task | 204 |
-
-Missing tasks return `404`. Invalid requests return `400` with a JSON error body.
-
-## Curl examples
-
-Application information:
-
-```bash
-curl http://localhost:8080/
-```
-
-Actuator health:
-
-```bash
-curl http://localhost:8080/actuator/health
-```
-
-List all tasks:
-
-```bash
-curl http://localhost:8080/api/tasks
-```
-
-Retrieve task `1`:
-
-```bash
-curl http://localhost:8080/api/tasks/1
-```
-
-Create a task:
-
-```bash
-curl -X POST http://localhost:8080/api/tasks \
-  -H "Content-Type: application/json" \
-  -d '{
-    "title": "Test AWS deployment",
-    "description": "Verify application and database connectivity"
-  }'
-```
-
-Update task `1`:
-
-```bash
-curl -X PUT http://localhost:8080/api/tasks/1 \
-  -H "Content-Type: application/json" \
-  -d '{
-    "title": "Test AWS deployment",
-    "description": "Elastic Beanstalk and RDS verified",
-    "completed": true
-  }'
-```
-
-Delete task `1`:
-
-```bash
-curl -i -X DELETE http://localhost:8080/api/tasks/1
-```
-
-## Environment variables
-
-| Variable | Local default | Purpose |
-| --- | --- | --- |
-| `DB_HOST` | `localhost` | PostgreSQL hostname or RDS endpoint |
-| `DB_PORT` | `5432` | PostgreSQL port |
-| `DB_NAME` | `taskdb` | Database name |
-| `DB_USERNAME` | `appadmin` | Database user |
-| `DB_PASSWORD` | No default; required | Database password supplied at runtime |
-| `PORT` | `8080` | HTTP listening port |
-| `SEED_DATA_ENABLED` | `true` | Create two sample tasks if the database is empty |
-
-The committed `.env.example` contains no credential value. Do not commit `.env`, AWS access keys, API keys, private keys, tokens, or production credentials. The repository also ignores common credential and private-key file formats.
-
-## Amazon RDS connection
-
-For AWS, set `DB_HOST` to the RDS PostgreSQL endpoint, `DB_PORT` to `5432`, and set the database name and credentials to values created for the RDS instance. The JDBC URL is assembled from these environment variables at startup.
-
-Place RDS in private subnets. Elastic Beanstalk instances must have network routes to those subnets. Configure the RDS security group to accept TCP port `5432` from the Elastic Beanstalk instance security group, not from the public internet.
-
-Use a dedicated application database user. Supply its password at deployment time through Elastic Beanstalk environment configuration or an approved secrets workflow; never put production credentials in Git, source bundles, screenshots, logs, or the Docker image.
-
-## Elastic Beanstalk configuration
-
-1. Create an Elastic Beanstalk environment using the current Docker platform.
-2. The GitHub Actions workflow verifies the full `Dockerfile`, builds the application JAR, and packages it with `Dockerfile.elasticbeanstalk` for deployment. This avoids compiling Java on the small Elastic Beanstalk instance.
-3. In the Elastic Beanstalk console, open **Configuration**, then configure environment properties.
-4. Add `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USERNAME`, `DB_PASSWORD`, and `PORT` (normally `8080` for this container).
-5. Set `SEED_DATA_ENABLED=false` when sample production data is not wanted.
-6. Configure the environment health-check path as `/actuator/health`.
-7. Enable log streaming to CloudWatch Logs and set an appropriate retention period.
-
-Do not deploy `docker-compose.yml` as the production topology. It is for local development; production uses Elastic Beanstalk plus the separate RDS instance.
-
-## Basic AWS deployment notes
-
-- The Docker image runs as a non-root user and listens on the configurable `PORT`.
-- The container health check calls `/actuator/health`, which includes database connectivity.
-- `spring.jpa.hibernate.ddl-auto=update` is intentional for this academic assignment.
-- Keep the Elastic Beanstalk environment and RDS in the same VPC, with RDS in private subnets.
-- Use Elastic Beanstalk application logs and enhanced health plus CloudWatch Logs for startup, API, and failure diagnosis.
-- `.github/workflows/deploy.yml` tests and builds every pull request and deploys pushes to `main`.
-- Deployment uses GitHub Actions OIDC with the repository variable `AWS_DEPLOY_ROLE_ARN`; no long-lived AWS access key is stored in GitHub.
-- The application does not need AWS SDK dependencies because it does not call AWS services directly.
-
-## S3, SQS, and Lambda
-
-The static example file is stored at `static/index.html`. In AWS, only objects under the bucket's `static/` prefix are granted public `s3:GetObject` access.
-
-The Lambda console handler is stored at `lambda/sqs_logger/lambda_function.py`. It accepts SQS batches, parses the nested S3 event, URL-decodes the object key, and logs the message ID, event name, bucket, and key. It also returns failed SQS message identifiers for partial-batch retry handling.
-
-Run its dependency-free unit test with:
+Run the Lambda test:
 
 ```bash
 python -m unittest discover -s lambda/sqs_logger -v
 ```
 
-The Lambda execution role needs `AWSLambdaSQSQueueExecutionRole`, and the SQS event source mapping should enable `ReportBatchItemFailures`.
-
-## Logs
-
-Follow all local Compose logs:
+Verify the Docker image:
 
 ```bash
-docker compose logs -f
+docker build -t aws-assignment-task-api:local .
 ```
 
-Follow only application logs:
+## Repository contents
 
-```bash
-docker compose logs -f app
+```text
+.github/workflows/deploy.yml       GitHub Actions CI/CD pipeline
+src/main                           Spring Boot application
+src/test                           Spring integration and context tests
+lambda/sqs_logger                  Lambda handler and unit test
+static/index.html                  Public S3 static-file example
+Dockerfile                         Full multi-stage application image
+Dockerfile.elasticbeanstalk        Lightweight Beanstalk runtime image
+docker-compose.yml                 Local PostgreSQL and application stack
+docs/screenshots                   Public-safe evidence embedded in this README
 ```
 
-Follow only PostgreSQL logs:
+## Cleanup when finished
 
-```bash
-docker compose logs -f postgres
-```
+To avoid ongoing charges, remove resources when the learning environment is no longer needed:
 
-Show the last 100 application log lines:
-
-```bash
-docker compose logs --tail=100 app
-```
-
-Inspect container state and health:
-
-```bash
-docker compose ps
-docker inspect --format='{{json .State.Health}}' aws-assignment-training-app-1
-```
-
-## Troubleshooting
-
-### Port already in use
-
-Stop the process or container using ports `8080` or `5432`, then run Compose again:
-
-```bash
-docker ps
-docker compose down
-```
-
-### Application cannot connect to PostgreSQL
-
-Confirm `DB_PASSWORD` is set in the ignored `.env` file, PostgreSQL is healthy, and the app uses `DB_HOST=postgres` under Compose:
-
-```bash
-docker compose ps
-docker compose logs postgres
-docker compose exec app printenv DB_HOST DB_PORT DB_NAME DB_USERNAME
-```
-
-Do not print `DB_PASSWORD` in logs or troubleshooting output.
-
-### Health check is failing
-
-Check the endpoint and application logs:
-
-```bash
-curl -i http://localhost:8080/actuator/health
-docker compose logs --tail=200 app
-```
-
-The health response includes database status. A database connection failure makes the overall health status unhealthy.
-
-### Rebuild after source changes
-
-```bash
-docker compose up --build --force-recreate
-```
-
-### Reset the local database
-
-This permanently removes local task data:
-
-```bash
-docker compose down --volumes
-docker compose up --build
-```
-
-### RDS connection fails on AWS
-
-Check the RDS endpoint and port, VPC/subnet routing, security-group rules, database credentials, and whether the RDS instance is available. Review Elastic Beanstalk and CloudWatch logs for the JDBC connection error without exposing credentials.
+1. Terminate the Elastic Beanstalk environment and delete unused application versions/source bundles.
+2. Delete the RDS instance and choose whether a final snapshot is needed.
+3. Empty and delete the project S3 bucket.
+4. Delete the SQS queue and Lambda function.
+5. Delete the two CloudWatch alarms and project log groups if no longer required.
+6. Delete GitHub deployment IAM roles/policies and the OIDC provider if they are not used elsewhere.
+7. Delete the custom VPC after all dependent resources have been removed.
